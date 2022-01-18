@@ -1,0 +1,44 @@
+#! /bin/bash
+
+set -o nounset
+set -o errexit -o errtrace
+shopt -s nullglob extglob
+
+function Usage
+{
+	echo >&2 "$@"
+	echo >&2 "$Usage"
+	exit 1
+}
+
+
+# Check for root
+(( $(id -u) == 0 )) || { echo >&2 "Must be root."; exit 1; }
+
+echo "Installing the necessary packages for your system."
+
+eval "$(grep "^ID=" /etc/os-release)"
+eval "$(grep "^VERSION_ID=" /etc/os-release)"
+
+case $ID in
+fedora)
+	dnf install -y wireguard-tools iptables qrencode
+
+	# In Fedora 34 and later, ip6tables-restore in got moved into
+	# "iptables-legacy" (and/or "iptables-nft") package that breaks
+	# "wg quick".  Fedora bug?
+	(( VERSION_ID < 34 )) || \
+		dnf install -y /usr/sbin/ip6tables-restore
+	;;
+ubuntu|debian)
+	apt install -y wireguard-tools resolvconf iptables qrencode
+	;;
+rocky|centos)
+	echo >&2 "Not supported at this time."
+	exit 1
+	;;
+*)
+	echo >&2 "Failed to determine type of system."
+	exit 1
+	;;
+esac

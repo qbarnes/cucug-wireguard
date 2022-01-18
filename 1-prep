@@ -1,0 +1,227 @@
+#! /bin/bash
+#
+# Generates files for hub and spoke wireguard configuration.
+#
+
+set -o nounset
+set -o errexit -o errtrace
+shopt -s nullglob extglob
+
+function Usage
+{
+	usage="Usage: $0 [-d dir] [-i iface] [-p peers] [-s]\n"
+	usage+="\t-d\tWireguard directory (def: $wgdir)\n"
+	usage+="\t-i\tInternet-facing ethernet interface (e.g. 'eth0')\n"
+	usage+="\t-p\tNumber of peers to support\n"
+	usage+="\t-s\tEnable use of preshared keys\n"
+
+	(($# == 0)) || echo >&2 "$@"
+	echo -ne >&2 "$usage"
+	exit 1
+}
+
+
+function Fatal
+{
+	echo -e >&2 "Fatal: $@"
+	exit 1
+}
+
+
+#
+# Check for root
+#
+
+(( $(id -u) == 0 )) || Fatal "Must be run as root."
+
+
+#
+# Set globals
+#
+
+wgdir="/etc/wireguard"
+iface=
+peers=1
+psken=0
+listenport=51820
+
+
+#
+# Parse arguments
+#
+
+while getopts d:i:p:s OPTION
+do
+	case $OPTION in
+	d)	wgdir="$OPTARG";;
+	i)	iface="$OPTARG";;
+	p)	peers="$OPTARG";;
+	s)	psken=1;;
+	\?)	Usage;;
+	esac
+done
+
+if [[ -z $iface ]]
+then
+	iface="$(ip route list default 2> /dev/null | \
+		sed -re 's/.*dev ([^ ]+) .*/\1/p' -e '1,$d')" || \
+			Fatal "Could not determine ethernet interface. " \
+				"Must set manually using '-i'."
+fi
+
+
+#
+# Determine IP
+#
+
+# Assuming first interface returned is internet-facing.  Could be a
+# bad assumption.
+endpoint=( $(ip a show dev "$iface" | \
+	sed -re 's:.*inet ([0-9.]+)/.*:\1:p' -e '1,$d') ) || \
+			Fatal "Could not determine IP address."
+
+
+#
+# Determine DNS settings
+#
+
+# Only picks up one of the DNS servers on ubuntu 20.04, works on 21.10.
+dnslist=( $(systemd-resolve --status 2> /dev/null | \
+		grep -m 1 'DNS Servers:' | sed -e 's/^.*://') )
+
+if (( ${#dnslist[@]} == 0 ))
+then
+	dnslist=()
+	while read a b c
+	do
+		[[ $a != "nameserver" ]] || dnslist+=( $b )
+	done < /etc/resolv.conf
+fi
+
+(( ${#dnslist[@]} > 0 )) || Fatal "Could not determine DNS server(s)."
+
+dnsstr=
+for d in "${dnslist[@]}"
+do
+	[[ -z $dnsstr ]] || dnsstr+=", "
+	dnsstr+="$d"
+done
+
+#
+# Give status
+#
+
+echo "Using ethernet interface '$iface'."
+echo "Using outbound IP address '${endpoint[0]}'."
+echo "Using DNS server(s) '$dnsstr'."
+
+
+#
+# Enable IP forwarding for wireguard
+#
+
+wcwg_file=/etc/sysctl.d/90-wireguard.conf
+if [[ ! -r $wcwg_file ]]
+then
+	scwg="# For wireguard\n"
+	scwg+="net.ipv4.ip_forward = 1\n"
+	scwg+="net.ipv6.conf.all.forwarding = 1\n"
+
+	echo "Creating '$wcwg_file'."
+	echo -ne "$scwg" > "$wcwg_file"
+
+	echo "Enabling IP forwarding."
+	sysctl -p
+fi
+
+
+#
+# Generate public and private key pairs
+#
+
+pf="$wgdir/peer"
+for ((p=0; p <= peers; ++p))
+do
+	wg genkey | (umask 077;tee "${pf}_${p}.key") | \
+			wg pubkey > "${pf}_${p}.pub"
+
+	(( !psken || p == 0 )) || \
+		(umask 077;wg genpsk > "${pf}_0-peer_${p}.psk")
+done
+echo "Encryption keypairs generated."
+
+
+#
+# Generate wireguard configuration files for hub
+#
+
+wg0_file="$wgdir/wg0.conf"
+
+[[ ! -r $wg0_file ]] || Fatal "File '$wg0_file' already exists.  Stopping."
+
+# Later: Randomize private IP addresses?
+wg_ip4p=10.212.100
+wg_ip6p=fd70:02:67
+
+wg0="# Activate this file with:\n"
+wg0+="#   systemctl enable --now wg-quick@wg0.service\n\n"
+wg0+="[Interface]\n"
+wg0+="Address = ${wg_ip4p}.254/24, ${wg_ip6p}::fe/64\n"
+wg0+="ListenPort = $listenport\n"
+wg0+="PrivateKey = $(<"$wgdir/peer_0.key")\n"
+wg0+="DNS = $dnsstr\n\n"
+wg0+="# If the server is behind a router and receives traffic via NAT,\n"
+wg0+="# these iptables rules are not needed.\n"
+
+declare -A a=([Up]=A [Down]=D)
+for t in 'Up' 'Down'
+do
+	for i in '' '6'
+	do
+		wg0+="Post$t = "
+		wg0+="ip${i}tables -${a[$t]} FORWARD -i %i -j ACCEPT; "
+		wg0+="ip${i}tables -${a[$t]} FORWARD -o %i -j ACCEPT; "
+		wg0+="ip${i}tables -t nat -${a[$t]} POSTROUTING "
+		wg0+="-o $iface -j MASQUERADE\n"
+	done
+done
+
+for ((p=1; p <= peers; ++p))
+do
+	pskf="$wgdir/peer_0-peer_${p}.psk"
+	wg0+="\n[Peer]\n"	
+	wg0+="PublicKey = $(<"$wgdir/peer_${p}.pub")\n"
+	[[ ! -r $pskf ]] || wg0+="PresharedKey = $(<"$pskf")\n"
+	wg0+="AllowedIPs = ${wg_ip4p}.${p}/32, ${wg_ip6p}::${p}/128\n"
+	wg0+="PersistentKeepalive = 25\n"
+done
+
+echo "Generating '$wg0_file'."
+echo -ne "$wg0" > "$wg0_file"
+
+
+#
+# Generate wireguard configuration files for spokes
+#
+
+for ((p=1; p <= peers; ++p))
+do
+	wgp="# Activate this file with:\n"
+	wgp+="#   systemctl enable --now wg-quick@wg0_${p}.service\n\n"
+	wgp+="[Interface]\n"
+	wgp+="Address = ${wg_ip4p}.${p}/32, ${wg_ip6p}::${p}/128\n"
+	wgp+="PrivateKey = $(<"$wgdir/peer_${p}.key")\n"
+	wgp+="DNS = $dnsstr\n\n"
+
+	pskf="$wgdir/peer_0-peer_${p}.psk"
+	wgp+="\n[Peer]\n"	
+	wgp+="PublicKey = $(<"$wgdir/peer_0.pub")\n"
+	[[ ! -r $pskf ]] || wgp+="PresharedKey = $(<"$pskf")\n"
+	wgp+="Endpoint = ${endpoint[0]}:$listenport\n"
+	wgp+="AllowedIPs = 0.0.0.0/0, ::/0\n"
+	wgp+="PersistentKeepalive = 25\n"
+
+	wgp_file="$wgdir/wg0_${p}.conf"
+	echo "Generating '$wgp_file' for copying to peer $p."
+	echo -ne "$wgp" > "$wgp_file"
+done
