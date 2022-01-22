@@ -1,0 +1,219 @@
+#! /bin/bash
+#
+# Deploy droplets for Wireguard to DigitalOcean
+#
+
+function FatalE
+{
+	local -i status=$1; shift
+	trap - EXIT
+
+	(( status != 0 )) || status=1
+
+	echo -e >&2 "Fatal: $@"
+	exit $status
+}
+
+
+function Fatal
+{
+	FatalE 1 "$@"
+}
+
+
+function ErrorHandler
+{
+	local -i status=$?
+	local cmd=$BASH_COMMAND
+	local -i line=$1
+	trap - EXIT
+
+	FatalE $status \
+		"Command '$cmd' on line $line failed with error code $status."
+}
+
+
+function OnExit
+{
+	local -i ret=$?
+	local cmd=$BASH_COMMAND
+
+	if (( $ret != 0 ))
+	then
+		echo >&2 "Uncaught error running '$cmd' ($ret)."
+		exit $ret
+	fi
+
+	exit 0
+}
+
+
+function RunDOCreate
+{
+	local name="$1"
+	local image="$2"
+	local tags="$3"
+	local user_data="$4"
+	local ssh_keys="$5"
+
+	doctl compute droplet create \
+		--region "nyc1" \
+		--size "s-1vcpu-1gb" \
+		--image "$image" \
+		--enable-ipv6 \
+		--enable-monitoring \
+		${tags:+--tag-names="$tags"} \
+		${user_data:+--user-data="$user_data"} \
+		${ssh_keys:+--ssh-keys="$ssh_keys"} \
+		--output json \
+		"$name" > /dev/null 2>&1
+}
+
+
+set -o nounset
+set -o errexit -o errtrace
+shopt -s nullglob extglob
+
+trap 'ErrorHandler $LINENO' ERR
+trap 'OnExit' EXIT
+
+
+(( $# != 0 )) || Fatal "Must specify images."
+
+images=("$@")
+dropletcnt=${#images[@]}
+(( dropletcnt >= 1 )) || Fatal "Specify one or more images."
+
+ml=('/' '-' '\' '|')
+
+hubimage="${images[0]}"
+spokeimages=("${images[@]:1}")
+
+#
+# Check for existing wg droplets
+#
+
+wgls=$(doctl compute droplet list --tag-name wg -o json 2> /dev/null)
+wgstatlist=($(echo "$wgls" | jq -r ".[].status"))
+(( ${#wgstatlist[@]} == 0 )) || \
+	Fatal "Found existing 'wg' droplets.  Quitting."
+
+
+#
+# Determine our ssh keys
+#
+
+sshkeyjson=$(doctl compute ssh-key -o json list 2> /dev/null)
+ssh_keys=$(echo "$sshkeyjson" | jq -r ".[].id")
+
+
+#
+# Make hub
+#
+
+type=hub
+RunDOCreate \
+	"wg-1-${hubimage}" "$hubimage" \
+	"wg,wg$type" "$(<userdata-$type)" \
+	"$ssh_keys" &
+
+
+#
+# Make spokes
+#
+
+type=spoke
+pn=2
+for image in "${spokeimages[@]}"
+do
+	i="wg-$pn-$image"
+	RunDOCreate \
+		"$i" "$image" \
+		"wg,wg$type" "$(<userdata-$type)" \
+		"$ssh_keys" &
+	(( ++pn )) || :
+done
+
+
+#
+# Poll until droplets are all active
+#
+
+echo "Waiting for all droplets to go active."
+
+mli=0
+while :
+do
+	activecnt=0
+	wgls=$(doctl compute droplet list --tag-name wg -o json 2> /dev/null)
+	wgstatlist=($(echo "$wgls" | jq -r ".[].status"))
+
+	for s in "${wgstatlist[@]}"
+	do
+		[[ "$s" != "active" ]] || (( ++activecnt )) || :
+	done
+
+	echo -n "   $activecnt of $dropletcnt are active."
+	echo -ne "  ${ml[$mli]}    \r"
+	(( activecnt != dropletcnt )) || break
+	mli=$(( (mli+1) % ${#ml[@]} ))
+	sleep 1
+done
+
+echo -e "\nAll droplets are active."
+
+
+#
+# Wait for all droplets to finish userdata scripts.
+# Can't use "doctl compute ssh ..." here since can't pass ssh -o arguments.
+#
+
+echo "Waiting for all droplets to finish their user data scripts."
+
+ssh_opts=(\
+	-o "StrictHostKeyChecking=no" \
+	-o "UserKnownHostsFile=/dev/null" \
+	-o "ConnectTimeout=5")
+ssh_cmd=(ssh -x "${ssh_opts[@]}" )
+
+wgls=$(doctl compute droplet list --tag-name wg -o json 2> /dev/null)
+wgips=($(echo "$wgls" | \
+	jq -r '.[].networks.v4[] | select(.type=="public") | .ip_address'))
+
+mli=0
+successcnt=0
+while :
+do
+	i=0
+	for ipadr in "${wgips[@]}"
+	do
+		status=$("${ssh_cmd[@]}" "root@$ipadr" \
+			"sh -c '[ -f ~root/.userdata-failed ] && \
+				echo failed || \
+				{ [ -f ~root/.userdata-success ] && \
+				echo success; }'" 2> /dev/null || exit 0)
+		case $status in
+		failed)
+			Fatal "Peer with IP address $ipadr failed to" \
+				"successfully complete userdata script."
+			;;
+		success)
+			(( ++successcnt )) || :
+			unset 'wgips[i]'
+			;;
+		esac
+		(( ++i )) || :
+	done
+
+	echo -n "   $successcnt of $dropletcnt have finished."
+	echo -ne "  ${ml[$mli]}    \r"
+	(( successcnt != dropletcnt )) || break
+	mli=$(( (mli+1) % ${#ml[@]} ))
+
+	wgips=("${wgips[@]}")
+	sleep 1
+done
+
+echo -e "\nAll droplets have finished their user data scripts."
+
+exit 0

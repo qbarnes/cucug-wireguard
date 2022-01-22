@@ -4,18 +4,13 @@ set -o nounset
 set -o errexit -o errtrace
 shopt -s nullglob extglob
 
-function Usage
-{
-	echo >&2 "$@"
-	echo >&2 "$Usage"
-	exit 1
-}
+trap '(( $? == 0 )) && \
+	touch ~root/.userdata-success || \
+	touch ~root/.userdata-failed' EXIT
 
+echo -e '\nset -o vi' >> ~root/.bashrc
 
-# Check for root
-(( $(id -u) == 0 )) || { echo >&2 "Must be root."; exit 1; }
-
-echo "Installing the necessary packages for your system."
+echo "Installing the necessary packages for your hub."
 
 eval "$(grep "^ID=" /etc/os-release)"
 eval "$(grep "^VERSION_ID=" /etc/os-release)"
@@ -29,9 +24,34 @@ fedora)
 	# "wg quick".  Fedora bug?
 	(( VERSION_ID < 34 )) || \
 		dnf install -y /usr/sbin/ip6tables-restore
+	dnf install -y bind-utils # dig and nslookup
 	;;
 ubuntu|debian)
+	apt update
 	apt install -y wireguard-tools resolvconf iptables qrencode
+	case $ID in
+	ubuntu)
+		# dig and nslookup
+		case $VERSION_ID in
+		18.04|20.04)
+			apt install -y dnsutils
+			;;
+		*)
+			apt install -y net-tools bind9-dnsutils
+			;;
+		esac
+		;;
+	*)
+		case $VERSION_ID in
+		9|10)
+			apt install -y dnsutils
+			;;
+		*)
+			apt install -y net-tools bind9-dnsutils
+			;;
+		esac
+		;;
+	esac
 	;;
 rocky|centos)
 	echo >&2 "Not supported at this time."

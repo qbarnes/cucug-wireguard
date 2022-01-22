@@ -1,0 +1,209 @@
+#! /bin/bash
+#
+# Deploy hub and spoke droplets with Wireguard.
+#
+# Runs on native system.
+#
+
+function FatalE
+{
+	local -i status=$1; shift
+	trap - EXIT
+
+	(( status != 0 )) || status=1
+
+	echo -e >&2 "Fatal: $@"
+	exit $status
+}
+
+
+function Fatal
+{
+	FatalE 1 "$@"
+}
+
+
+function ErrorHandler
+{
+	local -i status=$?
+	local cmd=$BASH_COMMAND
+	local -i line=$1
+	trap - EXIT
+
+	FatalE $status \
+		"Command '$cmd' on line $line failed with error code $status."
+}
+
+
+function OnExit
+{
+	local -i ret=$?
+	local cmd=$BASH_COMMAND
+
+	if (( $ret != 0 ))
+	then
+		echo >&2 "Uncaught error running '$cmd' ($ret)."
+		exit $ret
+	fi
+
+	exit 0
+}
+
+
+function Usage
+{
+	usage="Usage: $0 [-d dir] [-i iface] [-I prefix] [-k]"
+	usage+=" [-l listen_port]\n"
+	usage+="              [-r res_spokes]\n"
+	usage+="    -d    Wireguard directory (def: $wgdir)\n"
+	usage+="    -i    Internet-facing ethernet interface (e.g. 'eth0')\n"
+	usage+="    -I    Wireguard Internet interface prefix (def: 'wg0')\n"
+	usage+="    -k    Enable use of preshared keys\n"
+	usage+="    -l    Listen port\n"
+	usage+="    -r    Number of spokes to reserve for non-droplet hosts\n"
+
+	(($# == 0)) || echo >&2 "$@"
+	echo -ne >&2 "$usage"
+	exit 1
+}
+
+
+set -o nounset
+set -o errexit -o errtrace
+shopt -s nullglob extglob
+
+trap 'ErrorHandler $LINENO' ERR
+trap 'OnExit' EXIT
+
+
+#
+# Set globals
+#
+
+ssh_opts=(\
+	-o "StrictHostKeyChecking=no" \
+	-o "UserKnownHostsFile=/dev/null" \
+	-o "ConnectTimeout=5")
+ssh_cmd=(ssh -qx "${ssh_opts[@]}")
+
+declare wgdir="/etc/wireguard"
+declare wgipfx="wg0"
+declare iface=
+declare -i psken=0
+declare -i listenport=51820
+declare -i res_spokes=0
+
+
+#
+# Parse and check arguments
+#
+
+while getopts d:i:I:kl:r: OPTION
+do
+	case $OPTION in
+	d)	wgdir="$OPTARG";;
+	i)	iface="$OPTARG";;
+	I)	wgipfx="$OPTARG";;
+	k)	psken=1;;
+	l)	listenport="$OPTARG";;
+	r)	res_spokes="$OPTARG";;
+	\?)	Usage;;
+	esac
+done
+
+(( res_spokes >= 0 )) || Fatal "Bad number of reserved spokes."
+
+wggenargs=(-d "$wgdir")
+wggenargs+=(${iface:+-i "$iface"})
+wggenargs+=(-I "$wgipfx")
+((psken == 0)) || wggenargs+=(-k)
+wggenargs+=(-l "$listenport")
+((res_spokes == 0)) || wggenargs+=(-r "$res_spokes")
+
+
+#
+# Find hub's public IP address
+#
+
+echo "Finding hub's public IP address."
+
+wghubjson=$(doctl compute droplet list --tag-name wghub -o json 2> /dev/null)
+
+wghubname=$(echo "$wghubjson" | jq -r '.[].name')
+
+wghubip=$(echo "$wghubjson" | \
+	jq -r '.[].networks.v4[] | select(.type=="public") | .ip_address')
+
+[[ -n $wghubip ]] || Fatal "Can't determine hub's IP address."
+
+#
+# Find spokes' public and private IP addresses
+#
+
+wgspokejsons=$(doctl compute droplet list \
+			--tag-name wgspoke -o json 2> /dev/null)
+
+wgspokenamelist=($(echo "$wgspokejsons" | jq -r '.[].name'))
+
+wgspokeiplist=($(echo "$wgspokejsons" | \
+	jq -r '.[].networks.v4[] | select(.type=="public") | .ip_address'))
+
+wgspokepiplist=($(echo "$wgspokejsons" | \
+	jq -r '.[].networks.v4[] | select(.type=="private") | .ip_address'))
+
+spokecnt=${#wgspokeiplist[@]}
+echo "Droplet spokes found: $spokecnt"
+
+
+#
+# Initialize associative arrays linking names and IP addresses
+# and names and numeric identifiers.
+#
+
+wgips=("$wghubip" "${wgspokeiplist[@]}")
+
+declare -A wgspokeip wgspokepip wgspokeidx
+i=0
+for n in "${wgspokenamelist[@]}"
+do
+	wgspokeip[$n]=${wgspokeiplist[$i]}
+	wgspokepip[$n]=${wgspokepiplist[$i]}
+	ss=${n#wg-}
+	wgspokeidx[$n]=${ss%%-*}
+	(( ++i )) || :
+done
+
+
+#
+# Copy wg confs from hub to spokes and start services
+#
+
+echo "Enabling wireguard services on droplets."
+
+scp -pq "${ssh_opts[@]}" "wggenfiles" "root@$wghubip:"
+"${ssh_cmd[@]}" "root@$wghubip" \
+	"bash -c \"~root/wggenfiles ${wggenargs[@]} \
+		-s '$((spokecnt + res_spokes))' && \
+			systemctl enable -q --now wg-quick@wg0p1.service\""
+
+proxy_cmd=(ssh "${ssh_opts[@]}" -W %h:%p "root@$wghubip")
+proxy_cmdstr=$(printf "%q " "${proxy_cmd[@]}")
+jssh_cmd=("${ssh_cmd[@]}" -o ProxyCommand="$proxy_cmdstr")
+
+for n in "${wgspokenamelist[@]}"
+do
+	pip="${wgspokepip[$n]}"
+	idx="${wgspokeidx[$n]}"
+	echo "Processing '$n' with private IP $pip."
+	"${ssh_cmd[@]}" "root@$wghubip" \
+			"scp -pq ${ssh_opts[@]} \
+				/etc/wireguard/wg0p${idx}.conf \
+				root@$pip:/etc/wireguard"
+	"${jssh_cmd[@]}" "root@$pip" \
+			"systemctl enable -q --now wg-quick@wg0p${idx}.service"
+done
+
+echo "Enabling wireguard services on droplets are complete."
+
+
+exit 0

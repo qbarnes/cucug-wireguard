@@ -1,0 +1,313 @@
+#! /bin/bash
+#
+# Generates files for hub and spoke wireguard configuration.
+#
+# Runs on target hub system.
+#
+
+function Fatal
+{
+	echo -e >&2 "Fatal: $@"
+	exit 1
+}
+
+
+function FatalE
+{
+	local -i status=$1; shift
+	trap - EXIT
+
+	(( status != 0 )) || status=1
+
+	echo -e >&2 "Fatal: $@"
+	exit $status
+}
+
+
+function Fatal
+{
+	FatalE 1 "$@"
+}
+
+
+function ErrorHandler
+{
+	local -i status=$?
+	local cmd=$BASH_COMMAND
+	local -i line=$1
+	trap - EXIT
+
+	FatalE $status \
+		"Command '$cmd' on line $line failed with error code $status."
+}
+
+
+function OnExit
+{
+	local -i ret=$?
+	local cmd=$BASH_COMMAND
+
+	if (( $ret != 0 ))
+	then
+		echo >&2 "Uncaught error running '$cmd' ($ret)."
+		exit $ret
+	fi
+
+	exit 0
+}
+
+
+function Usage
+{
+	usage="Usage: $0 [-d dir] [-i iface] [-I prefix] [-k]"
+	usage+=" [-l listen_port]\n"
+	usage+="              [-r res_spokes] [-s total_spokes]\n"
+	usage+="    -d    Wireguard directory (def: $wgdir)\n"
+	usage+="    -i    Internet-facing ethernet interface (e.g. 'eth0')\n"
+	usage+="    -I    Wireguard Internet interface prefix (def: 'wg0')\n"
+	usage+="    -k    Enable use of preshared keys\n"
+	usage+="    -l    Listen port\n"
+	usage+="    -r    Number of spokes to reserve for non-Linux hosts\n"
+	usage+="    -s    Number of total spokes to support\n"
+
+	(($# == 0)) || echo >&2 "$@"
+	echo -ne >&2 "$usage"
+	exit 1
+}
+
+
+set -o nounset
+set -o errexit -o errtrace
+shopt -s nullglob extglob
+
+trap 'ErrorHandler $LINENO' ERR
+trap 'OnExit' EXIT
+
+
+#
+# Check prerequisites for root and for /etc/wireguard directory.
+#
+
+(( $(id -u) == 0 )) || Fatal "Must be run as root."
+
+[[ -d /etc/wireguard ]] || \
+	Fatal "Directory '/etc/wireguard' not found. " \
+		"Wireguard package not installed?"
+
+
+#
+# Set globals
+#
+
+declare wgdir="/etc/wireguard"
+declare wgipfx="wg0"
+declare iface=
+declare -i psken=0
+declare -i listenport=51820
+declare -i spokes=1
+declare -i res_spokes=0
+
+
+#
+# Parse and check arguments
+#
+
+while getopts d:i:I:kl:r:s: OPTION
+do
+	case $OPTION in
+	d)	wgdir="$OPTARG";;
+	i)	iface="$OPTARG";;
+	I)	wgipfx="$OPTARG";;
+	k)	psken=1;;
+	l)	listenport="$OPTARG";;
+	r)	res_spokes="$OPTARG";;
+	s)	spokes="$OPTARG";;
+	\?)	Usage;;
+	esac
+done
+
+if [[ -z $iface ]]
+then
+	iface="$(ip route list default 2> /dev/null | \
+		sed -re 's/.*dev ([^ ]+) .*/\1/p' -e '1,$d')" || \
+			Fatal "Could not determine ethernet interface. " \
+				"Must set manually using '-i'."
+fi
+
+(( res_spokes >= 0 )) || Fatal "Bad number of reserved spokes."
+declare -i comp_spokes=$((spokes - res_spokes))
+(( comp_spokes >= 0 )) || Fatal "Reserved spokes cannot be more total spokes."
+
+(( spokes >= 1 )) || Fatal "Must be at least 1 spoke."
+(( spokes <= 253 )) || Fatal "Can't handle that many spokes."
+
+declare -i last_comp_spoke=$((comp_spokes+1))
+declare -i last_spoke=$((spokes+1))
+
+#
+# Determine IP
+#
+
+# Assuming first interface returned is internet-facing.  Could be a
+# bad assumption.
+endpoint=( $(ip a show dev "$iface" | \
+	sed -re 's:.*inet ([0-9.]+)/.*:\1:p' -e '1,$d') ) || \
+			Fatal "Could not determine IP address."
+
+
+#
+# Determine DNS settings
+#
+
+# Only picks up one of the DNS servers on ubuntu 20.04, works on 21.10.
+dnslist=( $(systemd-resolve --status 2> /dev/null | \
+		grep -m 1 'DNS Servers:' | sed -e 's/^.*://') )
+
+if (( ${#dnslist[@]} == 0 ))
+then
+	dnslist=()
+	while read a b c
+	do
+		[[ $a != "nameserver" ]] || dnslist+=( $b )
+	done < /etc/resolv.conf
+fi
+
+(( ${#dnslist[@]} > 0 )) || Fatal "Could not determine DNS server(s)."
+
+dnsstr="${dnslist[@]}"
+dnsstr="${dnsstr// /, }"
+
+
+#
+# Give status
+#
+
+echo "Using ethernet interface '$iface'."
+echo "Using outbound IP address '${endpoint[0]}'."
+echo "Using DNS server(s) '$dnsstr'."
+
+
+#
+# Enable IP forwarding for wireguard
+#
+
+wcwg_file=/etc/sysctl.d/90-wireguard.conf
+if [[ ! -r $wcwg_file ]]
+then
+	scwg="# For wireguard\n"
+	scwg+="net.ipv4.ip_forward = 1\n"
+	scwg+="net.ipv6.conf.all.forwarding = 1\n"
+
+	echo "Creating '$wcwg_file'."
+	echo -ne "$scwg" > "$wcwg_file"
+
+	echo "Enabling IP forwarding."
+	sysctl -p "$wcwg_file" > /dev/null
+else
+	echo "Skipping '$wcwg_file' creation.  File already exists."
+fi
+
+
+#
+# Generate public and private key pairs
+#
+
+for ((p=1; p <= last_spoke; ++p))
+do
+	ppfxn="$wgdir/${wgipfx}p${p}"
+	wg genkey | (umask 077;tee "$ppfxn.key") | \
+			wg pubkey > "$ppfxn.pub"
+
+	(( !psken || p == 1 )) || \
+		(umask 077;wg genpsk > "$ppfxn.psk")
+done
+
+echo "Encryption keypairs generated."
+
+
+#
+# Generate wireguard configuration files for hub
+#
+
+ppfx1="$wgdir/${wgipfx}p1"
+wgp1_file="$ppfx1.conf"
+
+[[ ! -r $wgp1_file ]] || Fatal "File '$wgp1_file' already exists.  Stopping."
+
+# Later: Randomize private IP addresses?
+wg_ip4p=172.27.7
+wg_ip6p=fd70:02:67
+
+wgp1="# Activate this file with:\n"
+wgp1+="#   systemctl enable --now wg-quick@${wgipfx}p1.service\n\n"
+wgp1+="[Interface]\n"
+wgp1+="Address = ${wg_ip4p}.1/24, ${wg_ip6p}::1/64\n"
+wgp1+="ListenPort = $listenport\n"
+wgp1+="PrivateKey = $(<"$ppfx1.key")\n"
+#wgp1+="DNS = $dnsstr\n"
+wgp1+="\n# If the server is behind a router and receives traffic via NAT,\n"
+wgp1+="# these iptables rules are not needed.\n"
+
+declare -A a=([Up]=A [Down]=D)
+for t in 'Up' 'Down'
+do
+	for i in '' '6'
+	do
+		wgp1+="Post$t = "
+		wgp1+="ip${i}tables -${a[$t]} FORWARD -i %i -j ACCEPT; "
+		wgp1+="ip${i}tables -${a[$t]} FORWARD -o %i -j ACCEPT; "
+		wgp1+="ip${i}tables -t nat -${a[$t]} POSTROUTING "
+		wgp1+="-o $iface -j MASQUERADE\n"
+	done
+done
+
+for ((p=2; p <= last_spoke; ++p))
+do
+	ppfx1="$wgdir/${wgipfx}p${p}"
+	pskf="$ppfx1.psk"
+	wgp1+="\n[Peer]\n"
+	wgp1+="PublicKey = $(<"$ppfx1.pub")\n"
+	[[ ! -r $pskf ]] || wgp1+="PresharedKey = $(<"$pskf")\n"
+	wgp1+="AllowedIPs = ${wg_ip4p}.${p}/32, ${wg_ip6p}::${p}/128\n"
+	wgp1+="PersistentKeepalive = 25\n"
+done
+
+echo "Generating '$wgp1_file' for peer 1 (hub)."
+echo -ne "$wgp1" > "$wgp1_file"
+
+
+#
+# Generate wireguard configuration files for spokes
+#
+
+for ((p=2; p <= last_spoke; ++p))
+do
+	ppfx1="$wgdir/${wgipfx}p1"
+	ppfxnf="${wgipfx}p${p}"
+	ppfxn="$wgdir/$ppfxnf"
+	wgpn="# To activate this file, on Linux run:\n"
+	wgpn+="#   systemctl enable --now wg-quick@${ppfxnf}.service\n"
+	wgpn+="# For iOS or Android, display a QR code for Wireguard with:\n"
+	wgpn+="#   sed -e '/^#/d' /etc/wireguard/${ppfxnf}.conf | "
+	wgpn+="qrencode -t ansiutf8\n"
+	wgpn+="# Or on a laptop or desktop, enter the information "
+	wgpn+="in this file into Wireguard.\n\n"
+	wgpn+="[Interface]\n"
+	wgpn+="Address = ${wg_ip4p}.${p}/32, ${wg_ip6p}::${p}/128\n"
+	wgpn+="PrivateKey = $(<"$ppfxn.key")\n"
+	wgpn+="DNS = $dnsstr\n"
+	(( p > last_comp_spoke )) || \
+		wgpn+="PostUp = ping -c1 ${wg_ip4p}.1\n\n"
+
+	pskf="$ppfxn.psk"
+	wgpn+="\n[Peer]\n"
+	wgpn+="PublicKey = $(<"$ppfx1.pub")\n"
+	[[ ! -r $pskf ]] || wgpn+="PresharedKey = $(<"$pskf")\n"
+	wgpn+="Endpoint = ${endpoint[0]}:$listenport\n"
+	wgpn+="AllowedIPs = 0.0.0.0/0, ::/0\n"
+	wgpn+="PersistentKeepalive = 25\n"
+
+	wgpn_file="$ppfxn.conf"
+	echo "Generating '$wgpn_file' for copying to peer $p."
+	echo -ne "$wgpn" > "$wgpn_file"
+done

@@ -1,0 +1,64 @@
+#! /bin/bash
+
+set -o nounset
+set -o errexit -o errtrace
+shopt -s nullglob extglob
+
+trap '(( $? == 0 )) && \
+	touch ~root/.userdata-success || \
+	touch ~root/.userdata-failed' EXIT
+
+echo -e '\nset -o vi' >> ~root/.bashrc
+
+echo "Installing the necessary packages for your spoke."
+
+eval "$(grep "^ID=" /etc/os-release)"
+eval "$(grep "^VERSION_ID=" /etc/os-release)"
+
+case $ID in
+fedora)
+	dnf install -y wireguard-tools iptables
+
+	# In Fedora 34 and later, ip6tables-restore in got moved into
+	# "iptables-legacy" (and/or "iptables-nft") package that breaks
+	# "wg quick".  Fedora bug?
+	(( VERSION_ID < 34 )) || \
+		dnf install -y /usr/sbin/ip6tables-restore
+	dnf install -y bind-utils # dig and nslookup
+	;;
+ubuntu|debian)
+	apt update
+	apt install -y wireguard-tools resolvconf iptables
+	case $ID in
+	ubuntu)
+		# dig and nslookup
+		case $VERSION_ID in
+		18.04|20.04)
+			apt install -y dnsutils
+			;;
+		*)
+			apt install -y net-tools bind9-dnsutils
+			;;
+		esac
+		;;
+	*)
+		case $VERSION_ID in
+		9|10)
+			apt install -y dnsutils
+			;;
+		*)
+			apt install -y net-tools bind9-dnsutils
+			;;
+		esac
+		;;
+	esac
+	;;
+rocky|centos)
+	echo >&2 "Not supported at this time."
+	exit 1
+	;;
+*)
+	echo >&2 "Failed to determine type of system."
+	exit 1
+	;;
+esac

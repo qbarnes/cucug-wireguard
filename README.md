@@ -1,49 +1,54 @@
-[This repository](https://github.com/qbarnes/cucug-wireguard/) contains
-files for a Wireguard demostration for [CUCUG](http://cucug.org/).
+[This repository](https://github.com/qbarnes/cucug-wireguard/)
+contains files for a Wireguard (WG) demonstration using
+[DigitalOcean](https://www.digitalocean.com/) (DO) for
+[CUCUG](http://cucug.org/).
 
 Files:
 
 ```
-0-pkginst		Shell script to install necessary packages
-1-prep			Shell script to prepare host
-cucug-wireguard.pdf	Presentation given on Jan 20, 2022
+mkdroplets		Makes DigitalOcean droplets
+wgdroplets		Deploys wireguard to the DO droplets
+wggenfiles		Runs on the hub by wgdroplets to create WG config files
+userdata-hub		Cloud-init userdata file when initializing DO hub
+userdata-spoke		Cloud-init userdata file when initializing DO spokes
+cucug-wireguard.pdf	Presentation given on Feb 17, 2022
 README.md		This file
 ```
 
-To recreate the demonstration, copy the two shell script files locally,
-make them executable, and run them:
+To recreate the demonstration, first have a DigitalOcean account,
+install the `doctl` utility for your Linux distro, and run `doctl
+auth init`.  The scripts below will use the token from your `doctl`
+configuration file.  Now run:
 
-    # curl -LJO https://raw.githubusercontent.com/qbarnes/cucug-wireguard/master/0-pkginst
-    # curl -LJO https://raw.githubusercontent.com/qbarnes/cucug-wireguard/master/1-prep
-    # chmod +x 0-pkginst 1-prep
-    # ./0-pkginst
+    $ ./mkdroplets ubuntu-21-10-x64 debian-11-x64 fedora-35-x64
 
-The script `0-pkginst` handles installing necessary packages on
-newer Fedora and Ubuntu hosts.  It may be adapted later to handle
-other Linux operating systems.
+The first droplet image type is used for the Wireguard "hub".  The
+hub is the host that all traffic is routed through to the Internet.
+The remaining arguments, if any, are for additional droplets to be
+created as "spokes", the peers of the hub.
 
-When running `1-prep`, add an `-s` to use preshared keys and
-a number after a `-p` to specify how many other peers will be
-participating.  For example:
+    $ ./wgdroplets -k -r 3
 
-    # ./1-prep -s -p 6
+The `wgdroplets` script configures and deploys Wireguard to the
+previously created droplets.
 
-To activate the hub, run:
+In this example, the `-k` option says to enable using pre-shared
+keys between the peers.  Pre-shared keys add an extra layer of
+security.  The `-r 3` option says to provision three additional WG
+spoke configuration files in the hub's `/etc/wireguard` directory.
+These files can be used for configuring other spokes running
+elsewhere such as iOS or Android devices or laptops.
 
-    # systemctl enable --now wg-quick@wg0.service
+To use WG with an iOS or Android device, login to the hub and
+display the QR code of the configuration to use with:
 
-To install necessary packages, on each peer copy `0-pkginst` to `/tmp` and run:
+    # sed -e '/^#/d' /etc/wireguard/wg0pN.conf | qrencode -t ansiutf8
 
-    # /tmp/0-pkginst
+Replace `N` with the peer number you wish to use.
 
-Then for each peer that's a Linux host, copy
-`/etc/wireguard/wg0_N.conf` to its `/etc/wireguard` directory
-(replacing each `N` with a number for that peer) then run:
+Now install and open the Wireguard app, tap the '+' sign and
+specify loading a configuration via a QR code.  Show your phone's
+camera the above displayed QR code.
 
-    # systemctl enable --now wg-quick@wg0_N.service
-
-If a peer is an iOS or Android device, install the Wireguard app,
-open it, and tap the '+' sign to load a configuration via a QR code.
-To display the QR code for a peer, run:
-
-    # qrencode -t ansiutf8 -r /etc/wireguard/wg0_N.conf
+The `sed` filtering isn't strictly necessary.  It just reduces the
+size of the generated QR code.
