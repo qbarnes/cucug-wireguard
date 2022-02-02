@@ -29,29 +29,13 @@ fedora)
 ubuntu|debian)
 	apt update
 	apt install -y wireguard-tools resolvconf iptables
-	case $ID in
-	ubuntu)
-		# dig and nslookup
-		case $VERSION_ID in
-		18.04|20.04)
-			apt install -y dnsutils
-			;;
-		*)
-			apt install -y net-tools bind9-dnsutils
-			;;
-		esac
-		;;
-	*)
-		case $VERSION_ID in
-		9|10)
-			apt install -y dnsutils
-			;;
-		*)
-			apt install -y net-tools bind9-dnsutils
-			;;
-		esac
-		;;
-	esac
+	if [[ $ID == "ubuntu" ]] && (( ${VERSION_ID%.*} <= 20 )) || \
+	   [[ $ID == "debian" ]] && (( ${VERSION_ID} <= 10 ))
+	then
+		apt install -y dnsutils
+	else
+		apt install -y net-tools bind9-dnsutils
+	fi
 	;;
 rocky|centos)
 	echo >&2 "Not supported at this time."

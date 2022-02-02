@@ -136,6 +136,7 @@ wghubip=$(echo "$wghubjson" | \
 
 [[ -n $wghubip ]] || Fatal "Can't determine hub's IP address."
 
+
 #
 # Find spokes' public and private IP addresses
 #
@@ -175,35 +176,47 @@ done
 
 
 #
-# Copy wg confs from hub to spokes and start services
+# Run wggenfiles on hub and enable service
 #
 
-echo "Enabling wireguard services on droplets."
+echo "Enabling wireguard service on hub."
 
 scp -pq "${ssh_opts[@]}" "wggenfiles" "root@$wghubip:"
+
 "${ssh_cmd[@]}" "root@$wghubip" \
 	"bash -c \"~root/wggenfiles ${wggenargs[@]} \
 		-s '$((spokecnt + res_spokes))' && \
 			systemctl enable -q --now wg-quick@wg0p1.service\""
 
-proxy_cmd=(ssh "${ssh_opts[@]}" -W %h:%p "root@$wghubip")
-proxy_cmdstr=$(printf "%q " "${proxy_cmd[@]}")
-jssh_cmd=("${ssh_cmd[@]}" -o ProxyCommand="$proxy_cmdstr")
 
-for n in "${wgspokenamelist[@]}"
-do
-	pip="${wgspokepip[$n]}"
-	idx="${wgspokeidx[$n]}"
-	echo "Processing '$n' with private IP $pip."
-	"${ssh_cmd[@]}" "root@$wghubip" \
-			"scp -pq ${ssh_opts[@]} \
-				/etc/wireguard/wg0p${idx}.conf \
-				root@$pip:/etc/wireguard"
-	"${jssh_cmd[@]}" "root@$pip" \
+#
+# Copy wg confs from hub to spokes and start services
+#
+
+if (( spokecnt > 0 ))
+then
+	echo "Enabling wireguard services on spokes."
+
+	proxy_cmd=(ssh "${ssh_opts[@]}" -W %h:%p "root@$wghubip")
+	proxy_cmdstr=$(printf "%q " "${proxy_cmd[@]}")
+	jssh_cmd=("${ssh_cmd[@]}" -o ProxyCommand="$proxy_cmdstr")
+
+	for n in "${wgspokenamelist[@]}"
+	do
+		pip="${wgspokepip[$n]}"
+		idx="${wgspokeidx[$n]}"
+		echo "Processing '$n' with private IP $pip."
+		"${ssh_cmd[@]}" "root@$wghubip" \
+				"scp -pq ${ssh_opts[@]} \
+					/etc/wireguard/wg0p${idx}.conf \
+					root@$pip:/etc/wireguard"
+		"${jssh_cmd[@]}" "root@$pip" \
 			"systemctl enable -q --now wg-quick@wg0p${idx}.service"
-done
+	done
+fi
 
-echo "Enabling wireguard services on droplets are complete."
+
+echo "Enabling wireguard services are complete."
 
 
 exit 0
