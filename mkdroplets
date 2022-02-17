@@ -113,7 +113,7 @@ ssh_keys=$(echo "$sshkeyjson" | jq -r ".[].id")
 
 type=hub
 RunDOCreate \
-	"wg-1-${hubimage}" "$hubimage" \
+	"wg-p1" "$hubimage" \
 	"wg,wg$type" "$(<userdata-$type)" \
 	"$ssh_keys" &
 
@@ -126,7 +126,7 @@ type=spoke
 pn=2
 for image in "${spokeimages[@]}"
 do
-	i="wg-$pn-$image"
+	i="wg-p$pn"
 	RunDOCreate \
 		"$i" "$image" \
 		"wg,wg$type" "$(<userdata-$type)" \

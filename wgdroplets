@@ -169,8 +169,7 @@ for n in "${wgspokenamelist[@]}"
 do
 	wgspokeip[$n]=${wgspokeiplist[$i]}
 	wgspokepip[$n]=${wgspokepiplist[$i]}
-	ss=${n#wg-}
-	wgspokeidx[$n]=${ss%%-*}
+	wgspokeidx[$n]=${n#wg-p}
 	(( ++i )) || :
 done
 
