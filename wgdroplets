@@ -81,6 +81,7 @@ trap 'OnExit' EXIT
 #
 
 ssh_opts=(\
+	-o "ForwardAgent=yes" \
 	-o "StrictHostKeyChecking=no" \
 	-o "UserKnownHostsFile=/dev/null" \
 	-o "ConnectTimeout=5")
